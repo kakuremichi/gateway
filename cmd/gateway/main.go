@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
-	"net"
 
 	"github.com/yourorg/kakuremichi/gateway/internal/config"
 	"github.com/yourorg/kakuremichi/gateway/internal/proxy"
@@ -45,15 +46,11 @@ func main() {
 	// Prevent "declared and not used" error
 	_ = ctx
 
-	// Generate WireGuard keys if not provided
-	if cfg.WireguardPrivateKey == "" {
-		privateKey, publicKey, err := wireguard.GenerateKeyPair()
-		if err != nil {
-			log.Fatalf("Failed to generate WireGuard keys: %v", err)
-		}
-		cfg.WireguardPrivateKey = privateKey
-		slog.Info("Generated WireGuard keys", "public_key", publicKey)
+	privateKey, _, err := loadOrCreateWireguardKeys(cfg.WireguardPrivateKey, cfg.WireguardKeyFile)
+	if err != nil {
+		log.Fatalf("Failed to obtain WireGuard keys: %v", err)
 	}
+	cfg.WireguardPrivateKey = privateKey
 
 	// Initialize WireGuard interface
 	wgConfig := &wireguard.InterfaceConfig{
@@ -256,4 +253,38 @@ func ensureGatewayIPs(iface string, agents []struct {
 func maskToPrefix(mask net.IPMask) int {
 	ones, _ := mask.Size()
 	return ones
+}
+
+// loadOrCreateWireguardKeys： (秘密鍵, 公開鍵) を返す
+func loadOrCreateWireguardKeys(privateFromConfig, wireguardKeyFilePath string) (string, string, error) {
+	if strings.TrimSpace(privateFromConfig) != "" {
+		pub, err := wireguard.DerivePublicKey(strings.TrimSpace(privateFromConfig))
+		if err != nil {
+			return "", "", fmt.Errorf("invalid provided private key: %w", err)
+		}
+		return strings.TrimSpace(privateFromConfig), pub, nil
+	}
+
+	if data, err := os.ReadFile(wireguardKeyFilePath); err == nil {
+		priv := strings.TrimSpace(string(data))
+		pub, err := wireguard.DerivePublicKey(priv)
+		if err == nil {
+			slog.Info("Loaded WireGuard key from file", "path", filepath.Clean(wireguardKeyFilePath))
+			return priv, pub, nil
+		}
+		slog.Warn("Existing key file is invalid, regenerating", "path", filepath.Clean(wireguardKeyFilePath), "error", err)
+	} else if !os.IsNotExist(err) {
+		slog.Warn("Failed to read WireGuard key file, regenerating", "path", filepath.Clean(wireguardKeyFilePath), "error", err)
+	}
+
+	priv, pub, err := wireguard.GenerateKeyPair()
+	if err != nil {
+		return "", "", err
+	}
+	if writeErr := os.WriteFile(wireguardKeyFilePath, []byte(priv+"\n"), 0600); writeErr != nil {
+		slog.Warn("Failed to persist WireGuard key", "path", filepath.Clean(wireguardKeyFilePath), "error", writeErr)
+	} else {
+		slog.Info("Generated new WireGuard key and saved", "path", filepath.Clean(wireguardKeyFilePath))
+	}
+	return priv, pub, nil
 }

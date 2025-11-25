@@ -14,8 +14,9 @@ type Config struct {
 	APIKey     string
 
 	// WireGuard
-	WireguardPort      int
-	WireguardInterface string
+	WireguardPort       int
+	WireguardInterface  string
+	WireguardKeyFile    string
 	WireguardPrivateKey string // Generated locally, not from env
 
 	// HTTP/HTTPS
@@ -23,9 +24,9 @@ type Config struct {
 	HTTPSPort int
 
 	// Let's Encrypt
-	ACMEEmail     string
-	ACMEStaging   bool
-	ACMECacheDir  string
+	ACMEEmail    string
+	ACMEStaging  bool
+	ACMECacheDir string
 
 	// Server
 	PublicIP string
@@ -45,6 +46,7 @@ func LoadConfig() (*Config, error) {
 	// WireGuard
 	flag.IntVar(&cfg.WireguardPort, "wireguard-port", getEnvInt("WIREGUARD_PORT", 51820), "WireGuard UDP port")
 	flag.StringVar(&cfg.WireguardInterface, "wireguard-interface", getEnv("WIREGUARD_INTERFACE", "wg0"), "WireGuard interface name")
+	flag.StringVar(&cfg.WireguardKeyFile, "wireguard-key-file", getEnv("WIREGUARD_KEY_FILE", "wireguard.key"), "Path to persist WireGuard private key")
 
 	// HTTP/HTTPS
 	flag.IntVar(&cfg.HTTPPort, "http-port", getEnvInt("HTTP_PORT", 80), "HTTP port")
