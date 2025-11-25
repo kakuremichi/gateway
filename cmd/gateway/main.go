@@ -46,7 +46,7 @@ func main() {
 	// Prevent "declared and not used" error
 	_ = ctx
 
-	privateKey, _, err := loadOrCreateWireguardKeys(cfg.WireguardPrivateKey, cfg.WireguardKeyFile)
+	privateKey, _, err := loadOrCreateWireguardKeys(cfg.WireguardKeyFile)
 	if err != nil {
 		log.Fatalf("Failed to obtain WireGuard keys: %v", err)
 	}
@@ -256,15 +256,7 @@ func maskToPrefix(mask net.IPMask) int {
 }
 
 // loadOrCreateWireguardKeys： (秘密鍵, 公開鍵) を返す
-func loadOrCreateWireguardKeys(privateFromConfig, wireguardKeyFilePath string) (string, string, error) {
-	if strings.TrimSpace(privateFromConfig) != "" {
-		pub, err := wireguard.DerivePublicKey(strings.TrimSpace(privateFromConfig))
-		if err != nil {
-			return "", "", fmt.Errorf("invalid provided private key: %w", err)
-		}
-		return strings.TrimSpace(privateFromConfig), pub, nil
-	}
-
+func loadOrCreateWireguardKeys(wireguardKeyFilePath string) (string, string, error) {
 	if data, err := os.ReadFile(wireguardKeyFilePath); err == nil {
 		priv := strings.TrimSpace(string(data))
 		pub, err := wireguard.DerivePublicKey(priv)
