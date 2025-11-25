@@ -1,0 +1,13 @@
+services:
+  gateway:
+    build:
+      context: .
+    env_file:
+      - .env
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    volumes:
+      - ./wireguard.key:/app/wireguard.key
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
