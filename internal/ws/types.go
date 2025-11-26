@@ -90,26 +90,20 @@ type ErrorMessage struct {
 
 // GatewayConfig represents Gateway configuration from Control
 type GatewayConfig struct {
-	Gateway struct {
-		ID                  string `json:"id"`
-		Name                string `json:"name"`
-		PublicIP            string `json:"publicIp"`
-		WireguardPublicKey  string `json:"wireguardPublicKey"`
-		Region              string `json:"region"`
-		Status              string `json:"status"`
-	} `json:"gateway"`
 	Agents []struct {
-		ID                 string `json:"id"`
-		Name               string `json:"name"`
-		WireguardPublicKey string `json:"wireguardPublicKey"`
-		Subnet             string `json:"subnet"`
-		VirtualIP          string `json:"virtualIp"`
+		ID                 string   `json:"id"`
+		Name               string   `json:"name"`
+		WireguardPublicKey string   `json:"wireguardPublicKey"`
+		AllowedIPs         []string `json:"allowedIPs"` // List of /32 IPs for WireGuard peer
 	} `json:"agents"`
 	Tunnels []struct {
-		ID      string `json:"id"`
-		Domain  string `json:"domain"`
-		AgentID string `json:"agentId"`
-		Target  string `json:"target"`
-		Enabled bool   `json:"enabled"`
+		ID        string `json:"id"`
+		Domain    string `json:"domain"`
+		AgentID   string `json:"agentId"`
+		Target    string `json:"target"`
+		Enabled   bool   `json:"enabled"`
+		Subnet    string `json:"subnet"`    // e.g., "10.1.0.0/24"
+		GatewayIP string `json:"gatewayIp"` // e.g., "10.1.0.1"
+		AgentIP   string `json:"agentIp"`   // e.g., "10.1.0.100"
 	} `json:"tunnels"`
 }

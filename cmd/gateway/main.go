@@ -43,11 +43,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	privateKey, _, err := loadOrCreateWireguardKeys(cfg.WireguardKeyFile)
+	privateKey, publicKey, err := loadOrCreateWireguardKeys(cfg.WireguardKeyFile)
 	if err != nil {
 		log.Fatalf("Failed to obtain WireGuard keys: %v", err)
 	}
 	cfg.WireguardPrivateKey = privateKey
+	slog.Info("WireGuard keys ready", "public_key", publicKey)
 
 	// Initialize WireGuard interface
 	wgConfig := &wireguard.InterfaceConfig{
@@ -99,10 +100,7 @@ func main() {
 	}()
 
 	// Initialize WebSocket client (Control connection) with public key
-	var publicKey string
-	if wg != nil {
-		publicKey = wg.PublicKey()
-	}
+	// Note: publicKey is from loadOrCreateWireguardKeys, so it works even if WireGuard interface fails (e.g., on Windows)
 	wsClient := ws.NewClient(cfg, publicKey)
 	wsClient.SetConfigUpdateCallback(func(config ws.GatewayConfig) {
 		slog.Info("Received configuration update",
@@ -111,12 +109,16 @@ func main() {
 		)
 
 		// Update WireGuard peers
+		// Each agent's AllowedIPs now contains the /32 IPs for all its tunnels
 		if wg != nil {
 			var peers []wireguard.PeerConfig
 			for _, agent := range config.Agents {
+				if len(agent.AllowedIPs) == 0 {
+					continue // Skip agents with no tunnels
+				}
 				peer := wireguard.PeerConfig{
 					PublicKey:           agent.WireguardPublicKey,
-					AllowedIPs:          []string{agent.Subnet},
+					AllowedIPs:          agent.AllowedIPs,
 					PersistentKeepalive: 25,
 				}
 				peers = append(peers, peer)
@@ -130,35 +132,28 @@ func main() {
 		}
 
 		// Update HTTP proxy routes
+		// Each tunnel now has its own AgentIP
 		var routes []proxy.TunnelRoute
 		for _, tunnel := range config.Tunnels {
-			// Find the agent for this tunnel
-			var agentIP string
-			for _, agent := range config.Agents {
-				if agent.ID == tunnel.AgentID {
-					agentIP = agent.VirtualIP
-					break
-				}
+			if tunnel.AgentIP == "" {
+				slog.Warn("Tunnel has no AgentIP", "tunnel_id", tunnel.ID, "domain", tunnel.Domain)
+				continue
 			}
 
-			if agentIP != "" {
-				route := proxy.TunnelRoute{
-					ID:      tunnel.ID,
-					Domain:  tunnel.Domain,
-					AgentIP: agentIP,
-					Enabled: tunnel.Enabled,
-				}
-				routes = append(routes, route)
-			} else {
-				slog.Warn("Agent not found for tunnel", "tunnel_id", tunnel.ID, "agent_id", tunnel.AgentID)
+			route := proxy.TunnelRoute{
+				ID:      tunnel.ID,
+				Domain:  tunnel.Domain,
+				AgentIP: tunnel.AgentIP,
+				Enabled: tunnel.Enabled,
 			}
+			routes = append(routes, route)
 		}
 
 		httpProxy.UpdateRoutes(routes)
 
-		// Ensure WireGuard interface has IP addresses for each agent subnet (for routing)
+		// Ensure WireGuard interface has IP addresses for each tunnel's gateway IP
 		if wg != nil {
-			ensureGatewayIPs(cfg.WireguardInterface, config.Agents)
+			ensureGatewayIPs(cfg.WireguardInterface, config.Tunnels)
 		}
 	})
 
@@ -187,32 +182,34 @@ func main() {
 	fmt.Println("Gateway stopped")
 }
 
-// ensureGatewayIPs adds a /24 IP (x.y.0.1) for each agent subnet to the WireGuard interface.
-// This lets the kernel select a proper source address when proxying to agent virtual IPs.
-func ensureGatewayIPs(iface string, agents []struct {
-	ID                 string `json:"id"`
-	Name               string `json:"name"`
-	WireguardPublicKey string `json:"wireguardPublicKey"`
-	Subnet             string `json:"subnet"`
-	VirtualIP          string `json:"virtualIp"`
+// ensureGatewayIPs adds gateway IPs for each tunnel's subnet to the WireGuard interface.
+// This lets the kernel select a proper source address when proxying to agent IPs.
+func ensureGatewayIPs(iface string, tunnels []struct {
+	ID        string `json:"id"`
+	Domain    string `json:"domain"`
+	AgentID   string `json:"agentId"`
+	Target    string `json:"target"`
+	Enabled   bool   `json:"enabled"`
+	Subnet    string `json:"subnet"`
+	GatewayIP string `json:"gatewayIp"`
+	AgentIP   string `json:"agentIp"`
 }) {
 	// Bring interface up (ignore errors)
 	_ = exec.Command("ip", "link", "set", iface, "up").Run()
 
 	seen := make(map[string]struct{})
-	for _, ag := range agents {
-		_, ipnet, err := net.ParseCIDR(ag.Subnet)
+	for _, tunnel := range tunnels {
+		if tunnel.GatewayIP == "" || tunnel.Subnet == "" {
+			continue
+		}
+
+		_, ipnet, err := net.ParseCIDR(tunnel.Subnet)
 		if err != nil || ipnet == nil {
 			continue
 		}
-		subnetStr := ipnet.String()
-		// Compute gateway IP = network with last octet 1 (for /24)
-		ip := append(net.IP(nil), ipnet.IP.To4()...) // copy to avoid mutating ipnet
-		if ip == nil {
-			continue
-		}
-		ip[3] = 1
-		addr := fmt.Sprintf("%s/%d", ip.String(), maskToPrefix(ipnet.Mask))
+
+		// Use the tunnel's gateway IP with subnet mask
+		addr := fmt.Sprintf("%s/%d", tunnel.GatewayIP, maskToPrefix(ipnet.Mask))
 		if _, ok := seen[addr]; ok {
 			continue
 		}
@@ -228,14 +225,15 @@ func ensureGatewayIPs(iface string, agents []struct {
 			slog.Info("Added IP to WireGuard interface", "addr", addr, "iface", iface)
 		}
 
-		// Ensure route to agent subnet via wg interface
+		// Ensure route to tunnel subnet via wg interface
+		subnetStr := ipnet.String()
 		routeCmd := exec.Command("ip", "route", "add", subnetStr, "dev", iface)
 		if out, err := routeCmd.CombinedOutput(); err != nil {
 			if !strings.Contains(string(out), "File exists") && !strings.Contains(err.Error(), "File exists") {
-				slog.Warn("Failed to add route for agent subnet", "subnet", subnetStr, "iface", iface, "error", err, "out", string(out))
+				slog.Warn("Failed to add route for tunnel subnet", "subnet", subnetStr, "iface", iface, "error", err, "out", string(out))
 			}
 		} else {
-			slog.Info("Added route for agent subnet", "subnet", subnetStr, "iface", iface)
+			slog.Info("Added route for tunnel subnet", "subnet", subnetStr, "iface", iface)
 		}
 	}
 }
