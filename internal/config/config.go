@@ -29,8 +29,9 @@ type Config struct {
 	ACMECacheDir string
 
 	// Server
-	PublicIP string
-	Region   string
+	PublicIP            string
+	PublicIPv4Checker   string
+	Region              string
 }
 
 func LoadConfig() (*Config, error) {
@@ -58,7 +59,8 @@ func LoadConfig() (*Config, error) {
 	flag.StringVar(&cfg.ACMECacheDir, "acme-cache-dir", getEnv("ACME_CACHE_DIR", "./cache/autocert"), "ACME certificate cache directory")
 
 	// Server
-	flag.StringVar(&cfg.PublicIP, "public-ip", getEnv("PUBLIC_IP", "auto"), "Public IP address")
+	flag.StringVar(&cfg.PublicIP, "public-ip", getEnv("PUBLIC_IP", ""), "Public IP address (if empty, fetched from checker)")
+	flag.StringVar(&cfg.PublicIPv4Checker, "public-ipv4-checker", getEnv("PUBLIC_IPV4_CHECKER", "https://sweak.net/ip"), "URL to fetch public IPv4 address")
 	flag.StringVar(&cfg.Region, "region", getEnv("REGION", "local"), "Gateway region")
 
 	flag.Parse()

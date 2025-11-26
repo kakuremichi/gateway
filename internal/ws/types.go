@@ -36,6 +36,7 @@ type AuthMessage struct {
 	APIKey     string `json:"apiKey"`
 	ClientType string `json:"clientType"` // "gateway"
 	PublicKey  string `json:"publicKey,omitempty"`
+	PublicIP   string `json:"publicIp,omitempty"`
 }
 
 // AuthSuccessMessage is received upon successful authentication

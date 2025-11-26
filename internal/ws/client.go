@@ -4,7 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -15,6 +19,7 @@ import (
 type Client struct {
 	cfg       *config.Config
 	publicKey string // WireGuard public key
+	publicIP  string // Public IP address
 	conn      *websocket.Conn
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -43,10 +48,16 @@ func NewClient(cfg *config.Config, publicKey string) *Client {
 
 // Connect establishes WebSocket connection to Control server
 func (c *Client) Connect() error {
-	slog.Info("Connecting to Control server", "url", c.cfg.ControlURL)
+	// Fetch public IP before connecting
+	if err := c.fetchPublicIP(); err != nil {
+		slog.Warn("Failed to fetch public IP", "error", err)
+		// Continue anyway - publicIP will be empty
+	}
+
+	slog.Info("Connecting to Control server", "url", c.cfg.ControlURL, "publicIP", c.publicIP)
 
 	conn, _, err := websocket.DefaultDialer.Dial(c.cfg.ControlURL, nil)
-	if (err != nil) {
+	if err != nil {
 		return fmt.Errorf("failed to connect: %w", err)
 	}
 
@@ -67,6 +78,55 @@ func (c *Client) Connect() error {
 	return nil
 }
 
+// fetchPublicIP fetches the public IP from the configured checker URL
+func (c *Client) fetchPublicIP() error {
+	// Use configured PublicIP if set
+	if c.cfg.PublicIP != "" {
+		c.publicIP = c.cfg.PublicIP
+		slog.Info("Using configured public IP", "ip", c.publicIP)
+		return nil
+	}
+
+	// Fetch from checker URL
+	checkerURL := c.cfg.PublicIPv4Checker
+	if checkerURL == "" {
+		return fmt.Errorf("no public IP checker URL configured")
+	}
+
+	slog.Info("Fetching public IP", "url", checkerURL)
+
+	// Force IPv4 by using tcp4 network
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: 10 * time.Second}
+			return dialer.DialContext(ctx, "tcp4", addr)
+		},
+	}
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: transport,
+	}
+
+	resp, err := client.Get(checkerURL)
+	if err != nil {
+		return fmt.Errorf("failed to fetch public IP: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("public IP checker returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %w", err)
+	}
+
+	c.publicIP = strings.TrimSpace(string(body))
+	slog.Info("Fetched public IP", "ip", c.publicIP)
+	return nil
+}
+
 // authenticate sends authentication message
 func (c *Client) authenticate() error {
 	authMsg := AuthMessage{
@@ -77,6 +137,7 @@ func (c *Client) authenticate() error {
 		APIKey:     c.cfg.APIKey,
 		ClientType: "gateway",
 		PublicKey:  c.publicKey,
+		PublicIP:   c.publicIP,
 	}
 
 	data, err := json.Marshal(authMsg)
