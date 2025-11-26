@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -21,15 +22,21 @@ type Client struct {
 	publicKey string // WireGuard public key
 	publicIP  string // Public IP address
 	conn      *websocket.Conn
+	connMu    sync.Mutex
 	ctx       context.Context
 	cancel    context.CancelFunc
 
 	// Channels
 	send chan []byte
 	recv chan []byte
+	done chan struct{}
 
 	// Callbacks
 	onConfigUpdate func(config GatewayConfig)
+
+	// Reconnection
+	reconnecting bool
+	reconnectMu  sync.Mutex
 }
 
 // NewClient creates a new WebSocket client
@@ -43,16 +50,33 @@ func NewClient(cfg *config.Config, publicKey string) *Client {
 		cancel:    cancel,
 		send:      make(chan []byte, 256),
 		recv:      make(chan []byte, 256),
+		done:      make(chan struct{}),
 	}
 }
 
-// Connect establishes WebSocket connection to Control server
+// Connect establishes WebSocket connection to Control server with auto-reconnect
 func (c *Client) Connect() error {
 	// Fetch public IP before connecting
 	if err := c.fetchPublicIP(); err != nil {
 		slog.Warn("Failed to fetch public IP", "error", err)
 		// Continue anyway - publicIP will be empty
 	}
+
+	// Initial connection
+	if err := c.connect(); err != nil {
+		return err
+	}
+
+	// Start reconnection monitor
+	go c.reconnectLoop()
+
+	return nil
+}
+
+// connect performs the actual connection
+func (c *Client) connect() error {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
 
 	slog.Info("Connecting to Control server", "url", c.cfg.ControlURL, "publicIP", c.publicIP)
 
@@ -66,8 +90,12 @@ func (c *Client) Connect() error {
 
 	// Send authentication message
 	if err := c.authenticate(); err != nil {
+		conn.Close()
 		return fmt.Errorf("authentication failed: %w", err)
 	}
+
+	// Reset done channel for new connection
+	c.done = make(chan struct{})
 
 	// Start message handlers
 	go c.readPump()
@@ -78,33 +106,77 @@ func (c *Client) Connect() error {
 	return nil
 }
 
-// fetchPublicIP fetches the public IP from the configured checker URL
-func (c *Client) fetchPublicIP() error {
-	// Use configured PublicIP if set
-	if c.cfg.PublicIP != "" {
-		c.publicIP = c.cfg.PublicIP
-		slog.Info("Using configured public IP", "ip", c.publicIP)
-		return nil
-	}
+// reconnectLoop monitors connection and reconnects when needed
+func (c *Client) reconnectLoop() {
+	backoff := time.Second
+	maxBackoff := 30 * time.Second
 
-	// Fetch from checker URL
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-c.done:
+			// Connection closed, attempt reconnect
+			c.reconnectMu.Lock()
+			if c.reconnecting {
+				c.reconnectMu.Unlock()
+				continue
+			}
+			c.reconnecting = true
+			c.reconnectMu.Unlock()
+
+			slog.Info("Connection lost, attempting to reconnect...", "backoff", backoff)
+
+			for {
+				select {
+				case <-c.ctx.Done():
+					return
+				case <-time.After(backoff):
+					// Try to reconnect
+					if err := c.connect(); err != nil {
+						slog.Warn("Reconnection failed", "error", err, "next_retry", backoff*2)
+						backoff *= 2
+						if backoff > maxBackoff {
+							backoff = maxBackoff
+						}
+						continue
+					}
+
+					// Success
+					slog.Info("Reconnected to Control server")
+					backoff = time.Second
+					c.reconnectMu.Lock()
+					c.reconnecting = false
+					c.reconnectMu.Unlock()
+					break
+				}
+				break
+			}
+		}
+	}
+}
+
+// fetchPublicIP fetches the public IP from the configured checker
+func (c *Client) fetchPublicIP() error {
 	checkerURL := c.cfg.PublicIPv4Checker
 	if checkerURL == "" {
-		return fmt.Errorf("no public IP checker URL configured")
+		checkerURL = "https://sweak.net/ip"
 	}
 
 	slog.Info("Fetching public IP", "url", checkerURL)
 
-	// Force IPv4 by using tcp4 network
+	// Force IPv4 by using a custom dialer
+	dialer := &net.Dialer{
+		Timeout: 10 * time.Second,
+	}
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			dialer := &net.Dialer{Timeout: 10 * time.Second}
 			return dialer.DialContext(ctx, "tcp4", addr)
 		},
 	}
 	client := &http.Client{
-		Timeout:   10 * time.Second,
 		Transport: transport,
+		Timeout:   15 * time.Second,
 	}
 
 	resp, err := client.Get(checkerURL)
@@ -178,8 +250,7 @@ func (c *Client) authenticate() error {
 // readPump reads messages from WebSocket
 func (c *Client) readPump() {
 	defer func() {
-		c.conn.Close()
-		c.cancel()
+		c.signalDisconnect()
 	}()
 
 	for {
@@ -187,6 +258,8 @@ func (c *Client) readPump() {
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				slog.Error("WebSocket read error", "error", err)
+			} else {
+				slog.Info("WebSocket connection closed")
 			}
 			return
 		}
@@ -204,7 +277,7 @@ func (c *Client) writePump() {
 	ticker := time.NewTicker(54 * time.Second)
 	defer func() {
 		ticker.Stop()
-		c.conn.Close()
+		c.signalDisconnect()
 	}()
 
 	for {
@@ -215,14 +288,22 @@ func (c *Client) writePump() {
 				return
 			}
 
-			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+			c.connMu.Lock()
+			err := c.conn.WriteMessage(websocket.TextMessage, message)
+			c.connMu.Unlock()
+
+			if err != nil {
 				slog.Error("WebSocket write error", "error", err)
 				return
 			}
 
 		case <-ticker.C:
 			// Keep-alive ping
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			c.connMu.Lock()
+			err := c.conn.WriteMessage(websocket.PingMessage, nil)
+			c.connMu.Unlock()
+
+			if err != nil {
 				return
 			}
 
@@ -232,14 +313,25 @@ func (c *Client) writePump() {
 	}
 }
 
+// signalDisconnect signals that the connection has been lost
+func (c *Client) signalDisconnect() {
+	select {
+	case c.done <- struct{}{}:
+	default:
+	}
+}
+
 // handleMessages processes received messages
 func (c *Client) handleMessages() {
+	slog.Info("Message handler started")
 	for {
 		select {
 		case msg := <-c.recv:
+			slog.Debug("Raw message received", "length", len(msg))
 			c.handleMessage(msg)
 
 		case <-c.ctx.Done():
+			slog.Info("Message handler stopped")
 			return
 		}
 	}
@@ -249,11 +341,15 @@ func (c *Client) handleMessages() {
 func (c *Client) handleMessage(data []byte) {
 	var baseMsg BaseMessage
 	if err := json.Unmarshal(data, &baseMsg); err != nil {
-		slog.Error("Failed to parse message", "error", err)
+		preview := string(data)
+		if len(preview) > 200 {
+			preview = preview[:200]
+		}
+		slog.Error("Failed to parse message", "error", err, "data", preview)
 		return
 	}
 
-	slog.Debug("Received message", "type", baseMsg.Type)
+	slog.Info("Received message from Control", "type", baseMsg.Type)
 
 	switch baseMsg.Type {
 	case TypePing:
@@ -330,7 +426,11 @@ func (c *Client) heartbeat() {
 			}
 
 			data, _ := json.Marshal(statusMsg)
-			c.send <- data
+			select {
+			case c.send <- data:
+			default:
+				// Channel full, skip this heartbeat
+			}
 
 		case <-c.ctx.Done():
 			return
@@ -338,20 +438,17 @@ func (c *Client) heartbeat() {
 	}
 }
 
-// SetConfigUpdateCallback sets the callback for configuration updates
-func (c *Client) SetConfigUpdateCallback(callback func(GatewayConfig)) {
-	c.onConfigUpdate = callback
-}
-
 // Close closes the WebSocket connection
 func (c *Client) Close() {
 	c.cancel()
+	c.connMu.Lock()
 	if c.conn != nil {
 		c.conn.Close()
 	}
+	c.connMu.Unlock()
 }
 
-// Wait waits for the client to finish
-func (c *Client) Wait() {
-	<-c.ctx.Done()
+// SetConfigUpdateCallback sets the callback for configuration updates
+func (c *Client) SetConfigUpdateCallback(callback func(GatewayConfig)) {
+	c.onConfigUpdate = callback
 }
