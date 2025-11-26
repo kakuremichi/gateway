@@ -189,9 +189,7 @@ func (i *Interface) GetPeers() ([]PeerInfo, error) {
 
 // Close closes the WireGuard interface
 func (i *Interface) Close() error {
-	slog.Info("Closing WireGuard interface", "name", i.name)
-	// Note: Actual interface deletion would require platform-specific code
-	// For now, just log the closure
+	slog.Info("Closing WireGuard interface (Do nothing)", "name", i.name)
 	return nil
 }
 
