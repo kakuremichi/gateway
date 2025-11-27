@@ -33,7 +33,7 @@ kakuremichi の入口ノード。Control と WebSocket で接続し、設定を�
 ### コンフィグ（環境変数/フラグ）
 
 **Control 接続**
-- `CONTROL_URL` / `--control-url` : Control への WebSocket URL（例: `ws://localhost:3001`）
+- `CONTROL_URL` / `--control-url` : Control への WebSocket URL（例: `ws://localhost:3000/ws`）
 - `API_KEY` / `--api-key` : Control で発行したゲートウェイ用 API キー（必須）
 
 **WireGuard**
