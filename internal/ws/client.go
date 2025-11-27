@@ -78,6 +78,10 @@ func (c *Client) connect() error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 
+	// Close old connection if it exists to prevent leaks
+	if c.conn != nil {
+		c.conn.Close()
+	}
 	slog.Info("Connecting to Control server", "url", c.cfg.ControlURL, "publicIP", c.publicIP)
 
 	conn, _, err := websocket.DefaultDialer.Dial(c.cfg.ControlURL, nil)
