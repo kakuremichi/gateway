@@ -43,9 +43,6 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Prevent "declared and not used" error
-	_ = ctx
-
 	privateKey, _, err := loadOrCreateWireguardKeys(cfg.WireguardKeyFile)
 	if err != nil {
 		log.Fatalf("Failed to obtain WireGuard keys: %v", err)
@@ -172,12 +169,6 @@ func main() {
 	defer wsClient.Close()
 
 	slog.Info("Gateway started successfully")
-
-	// TODO: Initialize HTTP proxy
-	// proxy, err := proxy.NewHTTPProxy(cfg)
-	// if err != nil {
-	// 	log.Fatalf("Failed to create HTTP proxy: %v", err)
-	// }
 
 	// Wait for interrupt signal
 	sigCh := make(chan os.Signal, 1)
