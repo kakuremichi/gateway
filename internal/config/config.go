@@ -28,6 +28,10 @@ type Config struct {
 	ACMEStaging  bool
 	ACMECacheDir string
 
+	// Manual TLS (alternative to ACME)
+	TLSCertFile string
+	TLSKeyFile  string
+
 	// Server
 	PublicIP            string
 	PublicIPv4Checker   string
@@ -57,6 +61,10 @@ func LoadConfig() (*Config, error) {
 	flag.StringVar(&cfg.ACMEEmail, "acme-email", getEnv("ACME_EMAIL", "admin@example.com"), "ACME email for Let's Encrypt")
 	flag.BoolVar(&cfg.ACMEStaging, "acme-staging", getEnvBool("ACME_STAGING", false), "Use Let's Encrypt staging environment")
 	flag.StringVar(&cfg.ACMECacheDir, "acme-cache-dir", getEnv("ACME_CACHE_DIR", "./cache/autocert"), "ACME certificate cache directory")
+
+	// Manual TLS
+	flag.StringVar(&cfg.TLSCertFile, "tls-cert-file", getEnv("TLS_CERT_FILE", ""), "TLS certificate file (PEM) for manual TLS mode")
+	flag.StringVar(&cfg.TLSKeyFile, "tls-key-file", getEnv("TLS_KEY_FILE", ""), "TLS private key file (PEM) for manual TLS mode")
 
 	// Server
 	flag.StringVar(&cfg.PublicIP, "public-ip", getEnv("PUBLIC_IP", ""), "Public IP address (if empty, fetched from checker)")

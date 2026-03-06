@@ -56,8 +56,11 @@ func NewClient(cfg *config.Config, publicKey string) *Client {
 
 // Connect establishes WebSocket connection to Control server with auto-reconnect
 func (c *Client) Connect() error {
-	// Fetch public IP before connecting
-	if err := c.fetchPublicIP(); err != nil {
+	// Use pre-configured public IP if available, otherwise fetch from external service
+	if c.cfg.PublicIP != "" {
+		c.publicIP = c.cfg.PublicIP
+		slog.Info("Using configured public IP", "ip", c.publicIP)
+	} else if err := c.fetchPublicIP(); err != nil {
 		slog.Warn("Failed to fetch public IP", "error", err)
 		// Continue anyway - publicIP will be empty
 	}

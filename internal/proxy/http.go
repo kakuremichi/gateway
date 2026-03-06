@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -100,9 +101,13 @@ func (p *HTTPProxy) Start(ctx context.Context) error {
 		return err
 	}
 
-	// Start HTTPS server if ACME is enabled
+	// Start HTTPS server if ACME is enabled or manual TLS is configured
 	if p.acmeConfig.Enabled && p.acmeManager != nil {
 		if err := p.startHTTPSServer(ctx, mainHandler); err != nil {
+			return err
+		}
+	} else if p.acmeConfig.TLSCertFile != "" && p.acmeConfig.TLSKeyFile != "" {
+		if err := p.startManualTLSServer(ctx, mainHandler); err != nil {
 			return err
 		}
 	}
@@ -207,9 +212,36 @@ func (p *HTTPProxy) startHTTPSServer(ctx context.Context, mainHandler http.Handl
 	return nil
 }
 
+// startManualTLSServer starts the HTTPS server with manually provided certificate
+func (p *HTTPProxy) startManualTLSServer(ctx context.Context, mainHandler http.Handler) error {
+	slog.Info("Starting HTTPS proxy with manual TLS", "addr", p.httpsAddr,
+		"cert", p.acmeConfig.TLSCertFile, "key", p.acmeConfig.TLSKeyFile)
+
+	p.httpsServer = &http.Server{
+		Addr:    p.httpsAddr,
+		Handler: mainHandler,
+		TLSConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
+
+	go func() {
+		if err := p.httpsServer.ListenAndServeTLS(p.acmeConfig.TLSCertFile, p.acmeConfig.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+			slog.Error("HTTPS server error", "error", err)
+		}
+	}()
+
+	slog.Info("HTTPS server started with manual TLS certificate")
+	return nil
+}
+
 // handleRequest handles incoming HTTP/HTTPS requests
 func (p *HTTPProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 	host := r.Host
+	// Strip port from host if present (e.g., "example.com:8443" -> "example.com")
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
 	slog.Debug("Received request", "host", host, "path", r.URL.Path, "method", r.Method, "proto", r.Proto)
 
 	// Find route for this domain

@@ -14,6 +14,7 @@ import (
 	"syscall"
 
 	"github.com/yourorg/kakuremichi/gateway/internal/config"
+	"github.com/yourorg/kakuremichi/gateway/internal/exitnode"
 	"github.com/yourorg/kakuremichi/gateway/internal/proxy"
 	"github.com/yourorg/kakuremichi/gateway/internal/wireguard"
 	"github.com/yourorg/kakuremichi/gateway/internal/ws"
@@ -74,10 +75,12 @@ func main() {
 	// Configure ACME (enabled if email is provided and not default)
 	acmeEnabled := cfg.ACMEEmail != "" && cfg.ACMEEmail != "admin@example.com"
 	acmeConfig := proxy.ACMEConfig{
-		Email:    cfg.ACMEEmail,
-		Staging:  cfg.ACMEStaging,
-		CacheDir: cfg.ACMECacheDir,
-		Enabled:  acmeEnabled,
+		Email:       cfg.ACMEEmail,
+		Staging:     cfg.ACMEStaging,
+		CacheDir:    cfg.ACMECacheDir,
+		Enabled:     acmeEnabled,
+		TLSCertFile: cfg.TLSCertFile,
+		TLSKeyFile:  cfg.TLSKeyFile,
 	}
 
 	if acmeEnabled {
@@ -86,8 +89,13 @@ func main() {
 			"staging", cfg.ACMEStaging,
 			"cache_dir", cfg.ACMECacheDir,
 		)
+	} else if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		slog.Info("Manual TLS enabled",
+			"cert_file", cfg.TLSCertFile,
+			"key_file", cfg.TLSKeyFile,
+		)
 	} else {
-		slog.Info("ACME/TLS disabled, HTTP-only mode")
+		slog.Info("ACME/TLS disabled, HTTP-only mode. Set --acme-email to enable automatic HTTPS, or use --tls-cert-file/--tls-key-file for manual TLS")
 	}
 
 	httpProxy := proxy.NewHTTPProxy(httpAddr, httpsAddr, acmeConfig)
@@ -98,6 +106,10 @@ func main() {
 			slog.Error("HTTP proxy stopped", "error", err)
 		}
 	}()
+
+	// Initialize Exit Node proxies (will be started when config is received)
+	var exitHTTPProxy *exitnode.HTTPProxy
+	var exitSOCKS5Proxy *exitnode.SOCKS5Proxy
 
 	// Initialize WebSocket client (Control connection) with public key
 	// Note: publicKey is from loadOrCreateWireguardKeys, so it works even if WireGuard interface fails (e.g., on Windows)
@@ -155,6 +167,45 @@ func main() {
 		if wg != nil {
 			ensureGatewayIPs(cfg.WireguardInterface, config.Tunnels)
 		}
+
+		// Update Exit Node proxies
+		// Collect gateway IPs for tunnels with proxy enabled
+		var httpProxyIPs, socksProxyIPs []string
+		for _, tunnel := range config.Tunnels {
+			if tunnel.GatewayIP == "" {
+				continue
+			}
+			if tunnel.HTTPProxyEnabled {
+				httpProxyIPs = append(httpProxyIPs, tunnel.GatewayIP)
+			}
+			if tunnel.SOCKSProxyEnabled {
+				socksProxyIPs = append(socksProxyIPs, tunnel.GatewayIP)
+			}
+		}
+
+		// Start/update HTTP proxy
+		if len(httpProxyIPs) > 0 {
+			if exitHTTPProxy == nil {
+				exitHTTPProxy = exitnode.NewHTTPProxy(config.ProxyConfig.HTTPProxyPort)
+			}
+			if err := exitHTTPProxy.UpdateListeners(httpProxyIPs); err != nil {
+				slog.Error("Failed to update HTTP proxy listeners", "error", err)
+			}
+		} else if exitHTTPProxy != nil {
+			exitHTTPProxy.Stop()
+		}
+
+		// Start/update SOCKS5 proxy
+		if len(socksProxyIPs) > 0 {
+			if exitSOCKS5Proxy == nil {
+				exitSOCKS5Proxy = exitnode.NewSOCKS5Proxy(config.ProxyConfig.SOCKSProxyPort)
+			}
+			if err := exitSOCKS5Proxy.UpdateListeners(socksProxyIPs); err != nil {
+				slog.Error("Failed to update SOCKS5 proxy listeners", "error", err)
+			}
+		} else if exitSOCKS5Proxy != nil {
+			exitSOCKS5Proxy.Stop()
+		}
 	})
 
 	// Connect to Control server
@@ -175,6 +226,12 @@ func main() {
 
 	// Graceful shutdown
 	httpProxy.Shutdown()
+	if exitHTTPProxy != nil {
+		exitHTTPProxy.Stop()
+	}
+	if exitSOCKS5Proxy != nil {
+		exitSOCKS5Proxy.Stop()
+	}
 	if wg != nil {
 		wg.Close()
 	}
@@ -185,14 +242,16 @@ func main() {
 // ensureGatewayIPs adds gateway IPs for each tunnel's subnet to the WireGuard interface.
 // This lets the kernel select a proper source address when proxying to agent IPs.
 func ensureGatewayIPs(iface string, tunnels []struct {
-	ID        string `json:"id"`
-	Domain    string `json:"domain"`
-	AgentID   string `json:"agentId"`
-	Target    string `json:"target"`
-	Enabled   bool   `json:"enabled"`
-	Subnet    string `json:"subnet"`
-	GatewayIP string `json:"gatewayIp"`
-	AgentIP   string `json:"agentIp"`
+	ID                string `json:"id"`
+	Domain            string `json:"domain"`
+	AgentID           string `json:"agentId"`
+	Target            string `json:"target"`
+	Enabled           bool   `json:"enabled"`
+	Subnet            string `json:"subnet"`
+	GatewayIP         string `json:"gatewayIp"`
+	AgentIP           string `json:"agentIp"`
+	HTTPProxyEnabled  bool   `json:"httpProxyEnabled"`
+	SOCKSProxyEnabled bool   `json:"socksProxyEnabled"`
 }) {
 	// Bring interface up (ignore errors)
 	_ = exec.Command("ip", "link", "set", iface, "up").Run()
