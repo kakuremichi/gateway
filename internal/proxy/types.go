@@ -20,6 +20,10 @@ type ACMEConfig struct {
 	Staging   bool
 	CacheDir  string
 	Enabled   bool // Whether to enable ACME/TLS
+
+	// Manual TLS (alternative to ACME)
+	TLSCertFile string
+	TLSKeyFile  string
 }
 
 // HTTPProxy represents the HTTP reverse proxy for Gateway

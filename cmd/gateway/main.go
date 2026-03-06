@@ -75,10 +75,12 @@ func main() {
 	// Configure ACME (enabled if email is provided and not default)
 	acmeEnabled := cfg.ACMEEmail != "" && cfg.ACMEEmail != "admin@example.com"
 	acmeConfig := proxy.ACMEConfig{
-		Email:    cfg.ACMEEmail,
-		Staging:  cfg.ACMEStaging,
-		CacheDir: cfg.ACMECacheDir,
-		Enabled:  acmeEnabled,
+		Email:       cfg.ACMEEmail,
+		Staging:     cfg.ACMEStaging,
+		CacheDir:    cfg.ACMECacheDir,
+		Enabled:     acmeEnabled,
+		TLSCertFile: cfg.TLSCertFile,
+		TLSKeyFile:  cfg.TLSKeyFile,
 	}
 
 	if acmeEnabled {
@@ -87,8 +89,13 @@ func main() {
 			"staging", cfg.ACMEStaging,
 			"cache_dir", cfg.ACMECacheDir,
 		)
+	} else if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		slog.Info("Manual TLS enabled",
+			"cert_file", cfg.TLSCertFile,
+			"key_file", cfg.TLSKeyFile,
+		)
 	} else {
-		slog.Info("ACME/TLS disabled, HTTP-only mode")
+		slog.Info("ACME/TLS disabled, HTTP-only mode. Set --acme-email to enable automatic HTTPS, or use --tls-cert-file/--tls-key-file for manual TLS")
 	}
 
 	httpProxy := proxy.NewHTTPProxy(httpAddr, httpsAddr, acmeConfig)
