@@ -54,7 +54,11 @@ func (p *HTTPProxy) initACMEManager() {
 		Cache:  autocert.DirCache(p.acmeConfig.CacheDir),
 		HostPolicy: func(ctx context.Context, host string) error {
 			// Only allow certificates for domains that have active routes
-			if route, exists := p.routes[host]; exists && route.Enabled {
+			p.mu.RLock()
+			route, exists := p.routes[host]
+			enabled := exists && route.Enabled
+			p.mu.RUnlock()
+			if enabled {
 				slog.Info("ACME: Allowing certificate for domain", "domain", host)
 				return nil
 			}
@@ -88,7 +92,9 @@ func (p *HTTPProxy) UpdateRoutes(routes []TunnelRoute) {
 		}
 	}
 
+	p.mu.Lock()
 	p.routes = newRoutes
+	p.mu.Unlock()
 }
 
 // Start starts the HTTP and HTTPS proxy servers
@@ -245,7 +251,9 @@ func (p *HTTPProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 	slog.Debug("Received request", "host", host, "path", r.URL.Path, "method", r.Method, "proto", r.Proto)
 
 	// Find route for this domain
+	p.mu.RLock()
 	route, exists := p.routes[host]
+	p.mu.RUnlock()
 	if !exists {
 		slog.Warn("No route found for domain", "domain", host)
 		http.Error(w, "No tunnel configured for this domain", http.StatusNotFound)
@@ -322,7 +330,9 @@ func (p *HTTPProxy) Shutdown() error {
 
 // GetRoutes returns current routes (for testing/debugging)
 func (p *HTTPProxy) GetRoutes() map[string]*TunnelRoute {
-	result := make(map[string]*TunnelRoute)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make(map[string]*TunnelRoute, len(p.routes))
 	for k, v := range p.routes {
 		result[k] = v
 	}

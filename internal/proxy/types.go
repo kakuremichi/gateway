@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"net/http"
+	"sync"
 
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -28,6 +29,7 @@ type ACMEConfig struct {
 
 // HTTPProxy represents the HTTP reverse proxy for Gateway
 type HTTPProxy struct {
+	mu           sync.RWMutex            // guards routes
 	routes       map[string]*TunnelRoute // domain -> route
 	httpAddr     string                  // HTTP listen address
 	httpsAddr    string                  // HTTPS listen address

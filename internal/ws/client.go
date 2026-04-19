@@ -26,6 +26,11 @@ type Client struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
+	// Per-connection context; cancelled when the current socket disconnects,
+	// so readPump/writePump/handleMessages/heartbeat don't leak across reconnects.
+	connCtx    context.Context
+	connCancel context.CancelFunc
+
 	// Channels
 	send chan []byte
 	recv chan []byte
@@ -81,7 +86,10 @@ func (c *Client) connect() error {
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
 
-	// Close old connection if it exists to prevent leaks
+	// Stop any lingering goroutines from a previous connection
+	if c.connCancel != nil {
+		c.connCancel()
+	}
 	if c.conn != nil {
 		c.conn.Close()
 	}
@@ -104,11 +112,14 @@ func (c *Client) connect() error {
 	// Reset done channel for new connection
 	c.done = make(chan struct{})
 
-	// Start message handlers
-	go c.readPump()
-	go c.writePump()
-	go c.handleMessages()
-	go c.heartbeat()
+	// Fresh per-connection context
+	c.connCtx, c.connCancel = context.WithCancel(c.ctx)
+
+	// Start message handlers bound to this connection's context
+	go c.readPump(c.connCtx, c.conn)
+	go c.writePump(c.connCtx, c.conn)
+	go c.handleMessages(c.connCtx)
+	go c.heartbeat(c.connCtx)
 
 	return nil
 }
@@ -255,13 +266,11 @@ func (c *Client) authenticate() error {
 }
 
 // readPump reads messages from WebSocket
-func (c *Client) readPump() {
-	defer func() {
-		c.signalDisconnect()
-	}()
+func (c *Client) readPump(ctx context.Context, conn *websocket.Conn) {
+	defer c.signalDisconnect()
 
 	for {
-		_, message, err := c.conn.ReadMessage()
+		_, message, err := conn.ReadMessage()
 		if err != nil {
 			if !websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				slog.Info("WebSocket connection closed")
@@ -273,14 +282,14 @@ func (c *Client) readPump() {
 
 		select {
 		case c.recv <- message:
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
 // writePump writes messages to WebSocket
-func (c *Client) writePump() {
+func (c *Client) writePump(ctx context.Context, conn *websocket.Conn) {
 	ticker := time.NewTicker(54 * time.Second)
 	defer func() {
 		ticker.Stop()
@@ -291,12 +300,12 @@ func (c *Client) writePump() {
 		select {
 		case message, ok := <-c.send:
 			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
 
 			c.connMu.Lock()
-			err := c.conn.WriteMessage(websocket.TextMessage, message)
+			err := conn.WriteMessage(websocket.TextMessage, message)
 			c.connMu.Unlock()
 
 			if err != nil {
@@ -307,21 +316,26 @@ func (c *Client) writePump() {
 		case <-ticker.C:
 			// Keep-alive ping
 			c.connMu.Lock()
-			err := c.conn.WriteMessage(websocket.PingMessage, nil)
+			err := conn.WriteMessage(websocket.PingMessage, nil)
 			c.connMu.Unlock()
 
 			if err != nil {
 				return
 			}
 
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-// signalDisconnect signals that the connection has been lost
+// signalDisconnect signals that the connection has been lost and
+// cancels the per-connection context so all goroutines for that
+// connection can exit.
 func (c *Client) signalDisconnect() {
+	if c.connCancel != nil {
+		c.connCancel()
+	}
 	select {
 	case c.done <- struct{}{}:
 	default:
@@ -329,7 +343,7 @@ func (c *Client) signalDisconnect() {
 }
 
 // handleMessages processes received messages
-func (c *Client) handleMessages() {
+func (c *Client) handleMessages(ctx context.Context) {
 	slog.Info("Message handler started")
 	for {
 		select {
@@ -337,7 +351,7 @@ func (c *Client) handleMessages() {
 			slog.Debug("Raw message received", "length", len(msg))
 			c.handleMessage(msg)
 
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			slog.Info("Message handler stopped")
 			return
 		}
@@ -417,7 +431,7 @@ func (c *Client) handleConfigUpdate(data []byte) {
 }
 
 // heartbeat sends periodic status updates
-func (c *Client) heartbeat() {
+func (c *Client) heartbeat(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -439,7 +453,7 @@ func (c *Client) heartbeat() {
 				// Channel full, skip this heartbeat
 			}
 
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		}
 	}
