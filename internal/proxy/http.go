@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
@@ -19,10 +20,11 @@ import (
 // NewHTTPProxy creates a new HTTP reverse proxy
 func NewHTTPProxy(httpAddr, httpsAddr string, acmeConfig ACMEConfig) *HTTPProxy {
 	proxy := &HTTPProxy{
-		routes:     make(map[string]*TunnelRoute),
-		httpAddr:   httpAddr,
-		httpsAddr:  httpsAddr,
-		acmeConfig: acmeConfig,
+		routes:       make(map[string]*TunnelRoute),
+		httpAddr:     httpAddr,
+		httpsAddr:    httpsAddr,
+		acmeConfig:   acmeConfig,
+		controlCerts: make(map[string]*tls.Certificate),
 	}
 
 	// Initialize ACME manager if enabled
@@ -88,6 +90,7 @@ func (p *HTTPProxy) UpdateRoutes(routes []TunnelRoute) {
 			slog.Info("Added route",
 				"domain", route.Domain,
 				"agent_ip", route.AgentIP,
+				"tls_mode", route.TLSMode,
 			)
 		}
 	}
@@ -101,6 +104,10 @@ func (p *HTTPProxy) UpdateRoutes(routes []TunnelRoute) {
 func (p *HTTPProxy) Start(ctx context.Context) error {
 	// Create main handler
 	mainHandler := http.HandlerFunc(p.handleRequest)
+	p.mu.Lock()
+	p.mainHandler = mainHandler
+	p.ctx = ctx
+	p.mu.Unlock()
 
 	// Start HTTP server
 	if err := p.startHTTPServer(ctx, mainHandler); err != nil {
@@ -145,7 +152,10 @@ func (p *HTTPProxy) RuntimeStatus() RuntimeStatus {
 
 	tlsMode := "disabled"
 	manualTLSEnabled := p.acmeConfig.TLSCertFile != "" && p.acmeConfig.TLSKeyFile != ""
-	if p.acmeConfig.Enabled {
+	controlCertCount := len(p.controlCerts)
+	if controlCertCount > 0 {
+		tlsMode = "control"
+	} else if p.acmeConfig.Enabled {
 		tlsMode = "acme"
 	} else if manualTLSEnabled {
 		tlsMode = "manual"
@@ -161,8 +171,35 @@ func (p *HTTPProxy) RuntimeStatus() RuntimeStatus {
 		ACMEStaging:         p.acmeConfig.Staging,
 		ACMEEmailConfigured: p.acmeConfig.Email != "" && p.acmeConfig.Email != "admin@example.com",
 		ManualTLSEnabled:    manualTLSEnabled,
+		ControlCertCount:    controlCertCount,
 		RouteCount:          len(p.routes),
 	}
+}
+
+// UpdateCertificates replaces the Control-managed certificate store.
+func (p *HTTPProxy) UpdateCertificates(certificates []ControlCertificate) error {
+	newCerts := make(map[string]*tls.Certificate)
+	for _, bundle := range certificates {
+		cert, err := tls.X509KeyPair([]byte(bundle.CertificatePEM), []byte(bundle.PrivateKeyPEM))
+		if err != nil {
+			return fmt.Errorf("failed to parse certificate for %s: %w", bundle.Domain, err)
+		}
+		domain := normalizeHost(bundle.Domain)
+		newCerts[domain] = &cert
+		slog.Info("Loaded Control-managed certificate", "domain", domain, "certificate_id", bundle.ID)
+	}
+
+	p.mu.Lock()
+	p.controlCerts = newCerts
+	needsHTTPS := len(newCerts) > 0 && p.httpsServer == nil && p.mainHandler != nil && p.ctx != nil
+	ctx := p.ctx
+	handler := p.mainHandler
+	p.mu.Unlock()
+
+	if needsHTTPS {
+		return p.startDynamicTLSServer(ctx, handler, "control")
+	}
+	return nil
 }
 
 func (p *HTTPProxy) setHTTPListening(listening bool) {
@@ -188,27 +225,26 @@ func (p *HTTPProxy) startHTTPServer(ctx context.Context, mainHandler http.Handle
 		// ACME HTTP-01 challenge handler takes precedence
 		mux.Handle("/.well-known/acme-challenge/", p.acmeManager.HTTPHandler(nil))
 		slog.Info("ACME HTTP-01 challenge handler mounted at /.well-known/acme-challenge/")
+	}
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if p.acmeConfig.Enabled && p.acmeManager != nil && filepath.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
+			p.acmeManager.HTTPHandler(nil).ServeHTTP(w, r)
+			return
+		}
 
-		// Redirect all other HTTP traffic to HTTPS
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			// Check if this is an ACME challenge (shouldn't reach here, but just in case)
-			if filepath.HasPrefix(r.URL.Path, "/.well-known/acme-challenge/") {
-				p.acmeManager.HTTPHandler(nil).ServeHTTP(w, r)
-				return
-			}
-
-			// Redirect to HTTPS
+		host := hostWithoutPort(r.Host)
+		if p.shouldRedirectHTTP(host) {
 			target := "https://" + r.Host + r.URL.Path
 			if r.URL.RawQuery != "" {
 				target += "?" + r.URL.RawQuery
 			}
 			slog.Debug("Redirecting HTTP to HTTPS", "from", r.URL.String(), "to", target)
 			http.Redirect(w, r, target, http.StatusMovedPermanently)
-		})
-	} else {
-		// No ACME, serve HTTP directly
-		mux.Handle("/", mainHandler)
-	}
+			return
+		}
+
+		mainHandler.ServeHTTP(w, r)
+	})
 
 	p.httpServer = &http.Server{
 		Addr:    p.httpAddr,
@@ -234,40 +270,7 @@ func (p *HTTPProxy) startHTTPServer(ctx context.Context, mainHandler http.Handle
 
 // startHTTPSServer starts the HTTPS server with ACME
 func (p *HTTPProxy) startHTTPSServer(ctx context.Context, mainHandler http.Handler) error {
-	slog.Info("Starting HTTPS proxy", "addr", p.httpsAddr)
-
-	p.httpsServer = &http.Server{
-		Addr:    p.httpsAddr,
-		Handler: mainHandler,
-		TLSConfig: &tls.Config{
-			GetCertificate: p.acmeManager.GetCertificate,
-			MinVersion:     tls.VersionTLS12,
-			CipherSuites: []uint16{
-				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			},
-		},
-	}
-
-	listener, err := tls.Listen("tcp", p.httpsAddr, p.httpsServer.TLSConfig)
-	if err != nil {
-		return fmt.Errorf("failed to listen on HTTPS %s: %w", p.httpsAddr, err)
-	}
-	p.setHTTPSListening(true)
-
-	// Start HTTPS server in goroutine
-	go func() {
-		defer p.setHTTPSListening(false)
-		if err := p.httpsServer.Serve(listener); err != nil && err != http.ErrServerClosed {
-			slog.Error("HTTPS server error", "error", err)
-		}
-	}()
-
-	slog.Info("HTTPS server started with automatic ACME certificate management")
-
-	return nil
+	return p.startDynamicTLSServer(ctx, mainHandler, "acme")
 }
 
 // startManualTLSServer starts the HTTPS server with manually provided certificate
@@ -279,40 +282,152 @@ func (p *HTTPProxy) startManualTLSServer(ctx context.Context, mainHandler http.H
 	if err != nil {
 		return fmt.Errorf("failed to load manual TLS certificate: %w", err)
 	}
+	p.mu.Lock()
+	p.manualCert = &cert
+	p.mu.Unlock()
 
+	if err := p.startDynamicTLSServer(ctx, mainHandler, "manual"); err != nil {
+		return err
+	}
+
+	slog.Info("HTTPS server started with manual TLS certificate")
+	return nil
+}
+
+func (p *HTTPProxy) startDynamicTLSServer(ctx context.Context, mainHandler http.Handler, mode string) error {
+	p.mu.Lock()
+	if p.httpsServer != nil {
+		p.mu.Unlock()
+		return nil
+	}
 	p.httpsServer = &http.Server{
 		Addr:    p.httpsAddr,
 		Handler: mainHandler,
 		TLSConfig: &tls.Config{
-			MinVersion:   tls.VersionTLS12,
-			Certificates: []tls.Certificate{cert},
+			GetCertificate: p.getCertificate,
+			MinVersion:     tls.VersionTLS12,
+			CipherSuites: []uint16{
+				tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			},
 		},
 	}
+	server := p.httpsServer
+	p.mu.Unlock()
 
-	listener, err := tls.Listen("tcp", p.httpsAddr, p.httpsServer.TLSConfig)
+	slog.Info("Starting HTTPS proxy", "addr", p.httpsAddr, "mode", mode)
+	listener, err := tls.Listen("tcp", p.httpsAddr, server.TLSConfig)
 	if err != nil {
+		p.mu.Lock()
+		if p.httpsServer == server {
+			p.httpsServer = nil
+		}
+		p.mu.Unlock()
 		return fmt.Errorf("failed to listen on HTTPS %s: %w", p.httpsAddr, err)
 	}
 	p.setHTTPSListening(true)
 
 	go func() {
 		defer p.setHTTPSListening(false)
-		if err := p.httpsServer.Serve(listener); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTPS server error", "error", err)
 		}
 	}()
 
-	slog.Info("HTTPS server started with manual TLS certificate")
+	slog.Info("HTTPS server started", "mode", mode)
 	return nil
+}
+
+func (p *HTTPProxy) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	host := normalizeHost(hello.ServerName)
+	if host != "" {
+		p.mu.RLock()
+		if cert := p.controlCerts[host]; cert != nil {
+			p.mu.RUnlock()
+			return cert, nil
+		}
+		if cert := p.matchWildcardControlCertLocked(host); cert != nil {
+			p.mu.RUnlock()
+			return cert, nil
+		}
+		manualCert := p.manualCert
+		p.mu.RUnlock()
+
+		if p.acmeConfig.Enabled && p.acmeManager != nil {
+			return p.acmeManager.GetCertificate(hello)
+		}
+		if manualCert != nil {
+			return manualCert, nil
+		}
+		return nil, fmt.Errorf("no certificate configured for %s", host)
+	}
+
+	p.mu.RLock()
+	manualCert := p.manualCert
+	p.mu.RUnlock()
+	if manualCert != nil {
+		return manualCert, nil
+	}
+	if p.acmeConfig.Enabled && p.acmeManager != nil {
+		return p.acmeManager.GetCertificate(hello)
+	}
+	return nil, fmt.Errorf("no server name in TLS client hello")
+}
+
+func (p *HTTPProxy) shouldRedirectHTTP(host string) bool {
+	if p.acmeConfig.Enabled {
+		return true
+	}
+	host = normalizeHost(host)
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	route := p.routes[host]
+	if route == nil || !route.Enabled || !route.ForceHTTPS {
+		return false
+	}
+	return p.hasControlCertLocked(host)
+}
+
+func (p *HTTPProxy) hasControlCertLocked(host string) bool {
+	if p.controlCerts[host] != nil {
+		return true
+	}
+	return p.matchWildcardControlCertLocked(host) != nil
+}
+
+func (p *HTTPProxy) matchWildcardControlCertLocked(host string) *tls.Certificate {
+	for domain, cert := range p.controlCerts {
+		if !strings.HasPrefix(domain, "*.") {
+			continue
+		}
+		suffix := domain[1:]
+		if !strings.HasSuffix(host, suffix) {
+			continue
+		}
+		left := strings.TrimSuffix(host, suffix)
+		if left != "" && !strings.Contains(left, ".") {
+			return cert
+		}
+	}
+	return nil
+}
+
+func hostWithoutPort(host string) string {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h
+	}
+	return host
+}
+
+func normalizeHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(hostWithoutPort(host)), ".")
 }
 
 // handleRequest handles incoming HTTP/HTTPS requests
 func (p *HTTPProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
-	host := r.Host
-	// Strip port from host if present (e.g., "example.com:8443" -> "example.com")
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
+	host := normalizeHost(r.Host)
 	slog.Debug("Received request", "host", host, "path", r.URL.Path, "method", r.Method, "proto", r.Proto)
 
 	// Find route for this domain

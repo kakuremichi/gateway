@@ -158,15 +158,29 @@ func main() {
 			}
 
 			route := proxy.TunnelRoute{
-				ID:      tunnel.ID,
-				Domain:  tunnel.Domain,
-				AgentIP: tunnel.AgentIP,
-				Enabled: tunnel.Enabled,
+				ID:         tunnel.ID,
+				Domain:     tunnel.Domain,
+				AgentIP:    tunnel.AgentIP,
+				Enabled:    tunnel.Enabled,
+				TLSMode:    tunnel.TLSMode,
+				ForceHTTPS: tunnel.ForceHTTPS,
 			}
 			routes = append(routes, route)
 		}
 
 		httpProxy.UpdateRoutes(routes)
+		var certificateBundles []proxy.ControlCertificate
+		for _, cert := range config.Certificates {
+			certificateBundles = append(certificateBundles, proxy.ControlCertificate{
+				ID:             cert.ID,
+				Domain:         cert.Domain,
+				CertificatePEM: cert.CertificatePEM,
+				PrivateKeyPEM:  cert.PrivateKeyPEM,
+			})
+		}
+		if err := httpProxy.UpdateCertificates(certificateBundles); err != nil {
+			slog.Error("Failed to update Control-managed certificates", "error", err)
+		}
 
 		// Ensure WireGuard interface has IP addresses for each tunnel's gateway IP
 		if wg != nil {
@@ -257,6 +271,9 @@ func ensureGatewayIPs(iface string, tunnels []struct {
 	AgentIP           string `json:"agentIp"`
 	HTTPProxyEnabled  bool   `json:"httpProxyEnabled"`
 	SOCKSProxyEnabled bool   `json:"socksProxyEnabled"`
+	TLSMode           string `json:"tlsMode"`
+	CertificateID     string `json:"certificateId"`
+	ForceHTTPS        bool   `json:"forceHttps"`
 }) {
 	// Bring interface up (ignore errors)
 	_ = exec.Command("ip", "link", "set", iface, "up").Run()

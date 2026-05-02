@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"context"
+	"crypto/tls"
 	"net/http"
 	"sync"
 
@@ -9,10 +11,20 @@ import (
 
 // TunnelRoute represents a tunnel routing configuration
 type TunnelRoute struct {
-	ID      string
-	Domain  string
-	AgentIP string // Agent's virtual IP (e.g., "10.1.0.100")
-	Enabled bool
+	ID         string
+	Domain     string
+	AgentIP    string // Agent's virtual IP (e.g., "10.1.0.100")
+	Enabled    bool
+	TLSMode    string
+	ForceHTTPS bool
+}
+
+// ControlCertificate represents a certificate bundle pushed from Control.
+type ControlCertificate struct {
+	ID             string
+	Domain         string
+	CertificatePEM string
+	PrivateKeyPEM  string
 }
 
 // ACMEConfig holds ACME/Let's Encrypt configuration
@@ -38,6 +50,7 @@ type RuntimeStatus struct {
 	ACMEStaging         bool   `json:"acmeStaging"`
 	ACMEEmailConfigured bool   `json:"acmeEmailConfigured"`
 	ManualTLSEnabled    bool   `json:"manualTlsEnabled"`
+	ControlCertCount    int    `json:"controlCertCount"`
 	RouteCount          int    `json:"routeCount"`
 }
 
@@ -53,4 +66,8 @@ type HTTPProxy struct {
 	httpsServer    *http.Server            // HTTPS server instance
 	httpListening  bool                    // true while HTTP listener is active
 	httpsListening bool                    // true while HTTPS listener is active
+	mainHandler    http.Handler            // shared request handler for dynamic HTTPS startup
+	ctx            context.Context         // proxy lifetime context
+	controlCerts   map[string]*tls.Certificate
+	manualCert     *tls.Certificate
 }

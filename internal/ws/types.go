@@ -97,17 +97,26 @@ type GatewayConfig struct {
 		AllowedIPs         []string `json:"allowedIPs"` // List of /32 IPs for WireGuard peer
 	} `json:"agents"`
 	Tunnels []struct {
-		ID               string `json:"id"`
-		Domain           string `json:"domain"`
-		AgentID          string `json:"agentId"`
-		Target           string `json:"target"`
-		Enabled          bool   `json:"enabled"`
-		Subnet           string `json:"subnet"`    // e.g., "10.1.0.0/24"
-		GatewayIP        string `json:"gatewayIp"` // e.g., "10.1.0.254"
-		AgentIP          string `json:"agentIp"`   // e.g., "10.1.0.2"
-		HTTPProxyEnabled bool   `json:"httpProxyEnabled"`
-		SOCKSProxyEnabled bool  `json:"socksProxyEnabled"`
+		ID                string `json:"id"`
+		Domain            string `json:"domain"`
+		AgentID           string `json:"agentId"`
+		Target            string `json:"target"`
+		Enabled           bool   `json:"enabled"`
+		Subnet            string `json:"subnet"`    // e.g., "10.1.0.0/24"
+		GatewayIP         string `json:"gatewayIp"` // e.g., "10.1.0.254"
+		AgentIP           string `json:"agentIp"`   // e.g., "10.1.0.2"
+		HTTPProxyEnabled  bool   `json:"httpProxyEnabled"`
+		SOCKSProxyEnabled bool   `json:"socksProxyEnabled"`
+		TLSMode           string `json:"tlsMode"`
+		CertificateID     string `json:"certificateId"`
+		ForceHTTPS        bool   `json:"forceHttps"`
 	} `json:"tunnels"`
+	Certificates []struct {
+		ID             string `json:"id"`
+		Domain         string `json:"domain"`
+		CertificatePEM string `json:"certificatePem"`
+		PrivateKeyPEM  string `json:"privateKeyPem"`
+	} `json:"certificates"`
 	// Exit Node proxy configuration
 	ProxyConfig struct {
 		HTTPProxyPort  int `json:"httpProxyPort"`
