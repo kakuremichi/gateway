@@ -37,7 +37,8 @@ type Client struct {
 	done chan struct{}
 
 	// Callbacks
-	onConfigUpdate func(config GatewayConfig)
+	onConfigUpdate   func(config GatewayConfig)
+	onStatusMetadata func() map[string]interface{}
 
 	// Reconnection
 	reconnecting bool
@@ -120,6 +121,7 @@ func (c *Client) connect() error {
 	go c.writePump(c.connCtx, c.conn)
 	go c.handleMessages(c.connCtx)
 	go c.heartbeat(c.connCtx)
+	c.sendStatusUpdate()
 
 	return nil
 }
@@ -438,24 +440,31 @@ func (c *Client) heartbeat(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			statusMsg := StatusUpdateMessage{
-				BaseMessage: BaseMessage{
-					Type:      TypeStatusUpdate,
-					Timestamp: time.Now().UnixMilli(),
-				},
-				Status: "online",
-			}
-
-			data, _ := json.Marshal(statusMsg)
-			select {
-			case c.send <- data:
-			default:
-				// Channel full, skip this heartbeat
-			}
+			c.sendStatusUpdate()
 
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+func (c *Client) sendStatusUpdate() {
+	statusMsg := StatusUpdateMessage{
+		BaseMessage: BaseMessage{
+			Type:      TypeStatusUpdate,
+			Timestamp: time.Now().UnixMilli(),
+		},
+		Status: "online",
+	}
+	if c.onStatusMetadata != nil {
+		statusMsg.Metadata = c.onStatusMetadata()
+	}
+
+	data, _ := json.Marshal(statusMsg)
+	select {
+	case c.send <- data:
+	default:
+		// Channel full, skip this heartbeat
 	}
 }
 
@@ -472,4 +481,9 @@ func (c *Client) Close() {
 // SetConfigUpdateCallback sets the callback for configuration updates
 func (c *Client) SetConfigUpdateCallback(callback func(GatewayConfig)) {
 	c.onConfigUpdate = callback
+}
+
+// SetStatusMetadataProvider sets the function used to attach runtime state to status updates.
+func (c *Client) SetStatusMetadataProvider(provider func() map[string]interface{}) {
+	c.onStatusMetadata = provider
 }

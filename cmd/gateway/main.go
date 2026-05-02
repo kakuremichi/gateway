@@ -114,6 +114,11 @@ func main() {
 	// Initialize WebSocket client (Control connection) with public key
 	// Note: publicKey is from loadOrCreateWireguardKeys, so it works even if WireGuard interface fails (e.g., on Windows)
 	wsClient := ws.NewClient(cfg, publicKey)
+	wsClient.SetStatusMetadataProvider(func() map[string]interface{} {
+		return map[string]interface{}{
+			"httpProxy": httpProxy.RuntimeStatus(),
+		}
+	})
 	wsClient.SetConfigUpdateCallback(func(config ws.GatewayConfig) {
 		slog.Info("Received configuration update",
 			"agents_count", len(config.Agents),

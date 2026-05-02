@@ -85,3 +85,26 @@ func TestHTTPProxy_DisabledRoutesSkipped(t *testing.T) {
 		t.Error("enabled route should be served")
 	}
 }
+
+func TestHTTPProxy_RuntimeStatusReportsModeAndRoutes(t *testing.T) {
+	p := NewHTTPProxy(":8080", ":8443", ACMEConfig{
+		Email:   "ops@example.test",
+		Enabled: true,
+		Staging: true,
+	})
+	p.UpdateRoutes([]TunnelRoute{
+		{Domain: "on.test", AgentIP: "10.1.0.2", Enabled: true},
+		{Domain: "off.test", AgentIP: "10.2.0.2", Enabled: false},
+	})
+
+	status := p.RuntimeStatus()
+	if status.HTTPAddress != ":8080" || status.HTTPSAddress != ":8443" {
+		t.Fatalf("unexpected addresses: %#v", status)
+	}
+	if status.TLSMode != "acme" || !status.ACMEEnabled || !status.ACMEStaging || !status.ACMEEmailConfigured {
+		t.Fatalf("unexpected ACME status: %#v", status)
+	}
+	if status.RouteCount != 1 {
+		t.Fatalf("expected 1 active route, got %d", status.RouteCount)
+	}
+}

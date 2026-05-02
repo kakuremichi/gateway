@@ -138,6 +138,45 @@ func (p *HTTPProxy) Start(ctx context.Context) error {
 	return nil
 }
 
+// RuntimeStatus returns the current HTTP/HTTPS listener and TLS mode state.
+func (p *HTTPProxy) RuntimeStatus() RuntimeStatus {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	tlsMode := "disabled"
+	manualTLSEnabled := p.acmeConfig.TLSCertFile != "" && p.acmeConfig.TLSKeyFile != ""
+	if p.acmeConfig.Enabled {
+		tlsMode = "acme"
+	} else if manualTLSEnabled {
+		tlsMode = "manual"
+	}
+
+	return RuntimeStatus{
+		HTTPAddress:         p.httpAddr,
+		HTTPSAddress:        p.httpsAddr,
+		HTTPListening:       p.httpListening,
+		HTTPSListening:      p.httpsListening,
+		TLSMode:             tlsMode,
+		ACMEEnabled:         p.acmeConfig.Enabled,
+		ACMEStaging:         p.acmeConfig.Staging,
+		ACMEEmailConfigured: p.acmeConfig.Email != "" && p.acmeConfig.Email != "admin@example.com",
+		ManualTLSEnabled:    manualTLSEnabled,
+		RouteCount:          len(p.routes),
+	}
+}
+
+func (p *HTTPProxy) setHTTPListening(listening bool) {
+	p.mu.Lock()
+	p.httpListening = listening
+	p.mu.Unlock()
+}
+
+func (p *HTTPProxy) setHTTPSListening(listening bool) {
+	p.mu.Lock()
+	p.httpsListening = listening
+	p.mu.Unlock()
+}
+
 // startHTTPServer starts the HTTP server
 func (p *HTTPProxy) startHTTPServer(ctx context.Context, mainHandler http.Handler) error {
 	slog.Info("Starting HTTP proxy", "addr", p.httpAddr)
@@ -176,9 +215,16 @@ func (p *HTTPProxy) startHTTPServer(ctx context.Context, mainHandler http.Handle
 		Handler: mux,
 	}
 
+	listener, err := net.Listen("tcp", p.httpAddr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on HTTP %s: %w", p.httpAddr, err)
+	}
+	p.setHTTPListening(true)
+
 	// Start server in goroutine
 	go func() {
-		if err := p.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		defer p.setHTTPListening(false)
+		if err := p.httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTP server error", "error", err)
 		}
 	}()
@@ -205,10 +251,16 @@ func (p *HTTPProxy) startHTTPSServer(ctx context.Context, mainHandler http.Handl
 		},
 	}
 
+	listener, err := tls.Listen("tcp", p.httpsAddr, p.httpsServer.TLSConfig)
+	if err != nil {
+		return fmt.Errorf("failed to listen on HTTPS %s: %w", p.httpsAddr, err)
+	}
+	p.setHTTPSListening(true)
+
 	// Start HTTPS server in goroutine
 	go func() {
-		// ListenAndServeTLS with empty cert files uses TLSConfig.GetCertificate
-		if err := p.httpsServer.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
+		defer p.setHTTPSListening(false)
+		if err := p.httpsServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTPS server error", "error", err)
 		}
 	}()
@@ -223,16 +275,29 @@ func (p *HTTPProxy) startManualTLSServer(ctx context.Context, mainHandler http.H
 	slog.Info("Starting HTTPS proxy with manual TLS", "addr", p.httpsAddr,
 		"cert", p.acmeConfig.TLSCertFile, "key", p.acmeConfig.TLSKeyFile)
 
+	cert, err := tls.LoadX509KeyPair(p.acmeConfig.TLSCertFile, p.acmeConfig.TLSKeyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load manual TLS certificate: %w", err)
+	}
+
 	p.httpsServer = &http.Server{
 		Addr:    p.httpsAddr,
 		Handler: mainHandler,
 		TLSConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{cert},
 		},
 	}
 
+	listener, err := tls.Listen("tcp", p.httpsAddr, p.httpsServer.TLSConfig)
+	if err != nil {
+		return fmt.Errorf("failed to listen on HTTPS %s: %w", p.httpsAddr, err)
+	}
+	p.setHTTPSListening(true)
+
 	go func() {
-		if err := p.httpsServer.ListenAndServeTLS(p.acmeConfig.TLSCertFile, p.acmeConfig.TLSKeyFile); err != nil && err != http.ErrServerClosed {
+		defer p.setHTTPSListening(false)
+		if err := p.httpsServer.Serve(listener); err != nil && err != http.ErrServerClosed {
 			slog.Error("HTTPS server error", "error", err)
 		}
 	}()
