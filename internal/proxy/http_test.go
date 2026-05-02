@@ -108,3 +108,36 @@ func TestHTTPProxy_RuntimeStatusReportsModeAndRoutes(t *testing.T) {
 		t.Fatalf("expected 1 active route, got %d", status.RouteCount)
 	}
 }
+
+func TestHTTPProxy_ACMEDoesNotRedirectHTTPOnlyRoutes(t *testing.T) {
+	p := NewHTTPProxy(":0", ":0", ACMEConfig{
+		Email:   "ops@example.test",
+		Enabled: true,
+	})
+	p.UpdateRoutes([]TunnelRoute{
+		{
+			Domain:     "plain.test",
+			AgentIP:    "10.1.0.2",
+			Enabled:    true,
+			TLSMode:    "disabled",
+			ForceHTTPS: false,
+		},
+		{
+			Domain:     "secure.test",
+			AgentIP:    "10.2.0.2",
+			Enabled:    true,
+			TLSMode:    "auto",
+			ForceHTTPS: true,
+		},
+	})
+
+	if p.shouldRedirectHTTP("plain.test") {
+		t.Fatal("HTTP-only route should not redirect even when gateway ACME is enabled")
+	}
+	if p.shouldRedirectHTTP("unknown.test") {
+		t.Fatal("unknown hosts should not redirect")
+	}
+	if !p.shouldRedirectHTTP("secure.test") {
+		t.Fatal("TLS route with force HTTPS should redirect")
+	}
+}

@@ -377,15 +377,15 @@ func (p *HTTPProxy) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate
 }
 
 func (p *HTTPProxy) shouldRedirectHTTP(host string) bool {
-	if p.acmeConfig.Enabled {
-		return true
-	}
 	host = normalizeHost(host)
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	route := p.routes[host]
 	if route == nil || !route.Enabled || !route.ForceHTTPS {
 		return false
+	}
+	if p.acmeConfig.Enabled && route.TLSMode != "disabled" {
+		return true
 	}
 	return p.hasControlCertLocked(host)
 }
