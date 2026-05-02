@@ -14,6 +14,7 @@ kakuremichi の入口ノード。Control と WebSocket で接続し、設定を�
 - Linux（WireGuard インターフェース操作に `ip` コマンドを使用）
 - Control サーバーが起動済みで API キーを発行できること
 - ポート 80/443（HTTP/HTTPS）、51820/UDP（WireGuard）が開放されていること
+- Exit Node の HTTP/SOCKS5 プロキシを使う場合は、WireGuard インターフェース側だけ `8080/tcp` と `1080/tcp` を許可すること
 
 ## クイックスタート
 1. `.env.example` をコピーして値を入れる:
@@ -75,3 +76,4 @@ kakuremichi の入口ノード。Control と WebSocket で接続し、設定を�
 - WireGuard キーはリポジトリ直下に保存されるため、共有したくない場合は `.gitignore` 等で除外するか、パスを変えて運用してください。
 - HTTPS を有効にするには `ACME_EMAIL` に有効なメールアドレスを設定してください（`admin@example.com` 以外）。
 - WireGuard インターフェースの操作には root 権限または `CAP_NET_ADMIN` が必要です。
+- Exit Node の Gateway 側プロキシは WireGuard 経由で Agent から使うため、`8080/tcp` と `1080/tcp` は Public IP 側に開けないでください。ufw では `sudo ufw allow in on wg0 to any port 8080 proto tcp` と `sudo ufw allow in on wg0 to any port 1080 proto tcp` のように `wg0` に限定します。
