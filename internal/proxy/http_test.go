@@ -3,6 +3,7 @@ package proxy
 import (
 	"sync"
 	"testing"
+	"time"
 )
 
 // TestHTTPProxy_Routes_ConcurrentReadWrite exercises the RWMutex that
@@ -139,5 +140,52 @@ func TestHTTPProxy_ACMEDoesNotRedirectHTTPOnlyRoutes(t *testing.T) {
 	}
 	if !p.shouldRedirectHTTP("secure.test") {
 		t.Fatal("TLS route with force HTTPS should redirect")
+	}
+}
+
+func TestTunnelRoute_SelectBackend_WeightedRoundRobin(t *testing.T) {
+	route := &TunnelRoute{
+		Domain:        "app.test",
+		Enabled:       true,
+		currentWeight: make(map[string]int),
+		failedUntil:   make(map[string]time.Time),
+		Backends: []BackendRoute{
+			{ID: "a", AgentIP: "10.1.0.2", Enabled: true, Weight: 3, AgentStatus: "online"},
+			{ID: "b", AgentIP: "10.1.0.3", Enabled: true, Weight: 1, AgentStatus: "online"},
+		},
+	}
+
+	counts := map[string]int{}
+	for i := 0; i < 8; i++ {
+		backend, ok := route.SelectBackend()
+		if !ok {
+			t.Fatal("expected backend")
+		}
+		counts[backend.ID]++
+	}
+
+	if counts["a"] != 6 || counts["b"] != 2 {
+		t.Fatalf("unexpected weighted distribution: %#v", counts)
+	}
+}
+
+func TestTunnelRoute_SelectBackend_SkipsDrainingWhenPossible(t *testing.T) {
+	route := &TunnelRoute{
+		Domain:        "app.test",
+		Enabled:       true,
+		currentWeight: make(map[string]int),
+		failedUntil:   make(map[string]time.Time),
+		Backends: []BackendRoute{
+			{ID: "a", AgentIP: "10.1.0.2", Enabled: true, Draining: true, Weight: 100, AgentStatus: "online"},
+			{ID: "b", AgentIP: "10.1.0.3", Enabled: true, Weight: 1, AgentStatus: "online"},
+		},
+	}
+
+	backend, ok := route.SelectBackend()
+	if !ok {
+		t.Fatal("expected backend")
+	}
+	if backend.ID != "b" {
+		t.Fatalf("expected non-draining backend, got %s", backend.ID)
 	}
 }

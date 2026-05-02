@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/acme"
 	"golang.org/x/crypto/acme/autocert"
@@ -86,10 +87,26 @@ func (p *HTTPProxy) UpdateRoutes(routes []TunnelRoute) {
 	for i := range routes {
 		route := &routes[i]
 		if route.Enabled {
+			if route.currentWeight == nil {
+				route.currentWeight = make(map[string]int)
+			}
+			if route.failedUntil == nil {
+				route.failedUntil = make(map[string]time.Time)
+			}
+			p.mu.RLock()
+			oldRoute := p.routes[route.Domain]
+			p.mu.RUnlock()
+			if oldRoute != nil {
+				oldRoute.mu.Lock()
+				route.currentWeight = oldRoute.currentWeight
+				route.failedUntil = oldRoute.failedUntil
+				oldRoute.mu.Unlock()
+			}
 			newRoutes[route.Domain] = route
 			slog.Info("Added route",
 				"domain", route.Domain,
 				"agent_ip", route.AgentIP,
+				"backends", len(route.Backends),
 				"tls_mode", route.TLSMode,
 			)
 		}
@@ -425,6 +442,107 @@ func normalizeHost(host string) string {
 	return strings.TrimSuffix(strings.ToLower(hostWithoutPort(host)), ".")
 }
 
+// SelectBackend chooses a backend using priority, drain state, passive health,
+// and smooth weighted round-robin.
+func (r *TunnelRoute) SelectBackend() (BackendRoute, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	candidates := r.selectableBackends(false)
+	if len(candidates) == 0 {
+		candidates = r.selectableBackends(true)
+	}
+	if len(candidates) == 0 {
+		return BackendRoute{}, false
+	}
+
+	minPriority := candidates[0].Priority
+	for _, backend := range candidates {
+		if backend.Priority < minPriority {
+			minPriority = backend.Priority
+		}
+	}
+	candidates = filterBackends(candidates, func(backend BackendRoute) bool {
+		return backend.Priority == minPriority
+	})
+
+	nonDraining := filterBackends(candidates, func(backend BackendRoute) bool {
+		return !backend.Draining
+	})
+	if len(nonDraining) > 0 {
+		candidates = nonDraining
+	}
+
+	totalWeight := 0
+	bestIndex := 0
+	bestWeight := -1
+	for index, backend := range candidates {
+		weight := backend.Weight
+		if weight <= 0 {
+			weight = 1
+		}
+		totalWeight += weight
+		current := r.currentWeight[backend.ID] + weight
+		r.currentWeight[backend.ID] = current
+		if current > bestWeight {
+			bestWeight = current
+			bestIndex = index
+		}
+	}
+
+	selected := candidates[bestIndex]
+	r.currentWeight[selected.ID] -= totalWeight
+	return selected, true
+}
+
+// MarkBackendFailure temporarily removes a backend from selection after a proxy error.
+func (r *TunnelRoute) MarkBackendFailure(backendID string) {
+	if backendID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.failedUntil[backendID] = time.Now().Add(30 * time.Second)
+}
+
+func (r *TunnelRoute) selectableBackends(includeFailed bool) []BackendRoute {
+	now := time.Now()
+	backends := r.Backends
+	if len(backends) == 0 && r.AgentIP != "" {
+		backends = []BackendRoute{{
+			ID:      "legacy:" + r.AgentIP,
+			AgentIP: r.AgentIP,
+			Enabled: true,
+			Weight:  100,
+		}}
+	}
+
+	var candidates []BackendRoute
+	for _, backend := range backends {
+		if !backend.Enabled || backend.AgentIP == "" {
+			continue
+		}
+		if backend.AgentStatus != "" && backend.AgentStatus != "online" {
+			continue
+		}
+		if !includeFailed && r.failedUntil[backend.ID].After(now) {
+			continue
+		}
+		candidates = append(candidates, backend)
+	}
+	return candidates
+}
+
+func filterBackends(backends []BackendRoute, keep func(BackendRoute) bool) []BackendRoute {
+	filtered := backends[:0]
+	for _, backend := range backends {
+		if keep(backend) {
+			filtered = append(filtered, backend)
+		}
+	}
+	return filtered
+}
+
 // handleRequest handles incoming HTTP/HTTPS requests
 func (p *HTTPProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 	host := normalizeHost(r.Host)
@@ -446,10 +564,17 @@ func (p *HTTPProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build target URL (Agent's virtual IP)
-	targetURL, err := url.Parse("http://" + route.AgentIP + ":80")
+	backend, ok := route.SelectBackend()
+	if !ok {
+		slog.Warn("No available backend for route", "domain", host)
+		http.Error(w, "No available backend", http.StatusServiceUnavailable)
+		return
+	}
+
+	// Build target URL (Agent backend virtual IP)
+	targetURL, err := url.Parse("http://" + backend.AgentIP + ":80")
 	if err != nil {
-		slog.Error("Invalid agent IP", "agent_ip", route.AgentIP, "error", err)
+		slog.Error("Invalid agent IP", "agent_ip", backend.AgentIP, "backend_id", backend.ID, "error", err)
 		http.Error(w, "Invalid target configuration", http.StatusInternalServerError)
 		return
 	}
@@ -484,13 +609,15 @@ func (p *HTTPProxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Error handler
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		slog.Error("Proxy error", "error", err, "agent_ip", route.AgentIP)
+		route.MarkBackendFailure(backend.ID)
+		slog.Error("Proxy error", "error", err, "agent_ip", backend.AgentIP, "backend_id", backend.ID)
 		http.Error(w, "Bad Gateway", http.StatusBadGateway)
 	}
 
 	slog.Info("Proxying request",
 		"domain", host,
-		"agent_ip", route.AgentIP,
+		"agent_ip", backend.AgentIP,
+		"backend_id", backend.ID,
 		"path", r.URL.Path,
 		"tls", r.TLS != nil,
 	)

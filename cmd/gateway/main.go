@@ -149,11 +149,25 @@ func main() {
 		}
 
 		// Update HTTP proxy routes
-		// Each tunnel now has its own AgentIP
+		// Each tunnel can now have multiple Agent backends.
 		var routes []proxy.TunnelRoute
 		for _, tunnel := range config.Tunnels {
-			if tunnel.AgentIP == "" {
-				slog.Warn("Tunnel has no AgentIP", "tunnel_id", tunnel.ID, "domain", tunnel.Domain)
+			var backends []proxy.BackendRoute
+			for _, backend := range tunnel.Backends {
+				backends = append(backends, proxy.BackendRoute{
+					ID:          backend.ID,
+					AgentID:     backend.AgentID,
+					AgentIP:     backend.AgentIP,
+					Target:      backend.Target,
+					Enabled:     backend.Enabled,
+					Draining:    backend.Draining,
+					Weight:      backend.Weight,
+					Priority:    backend.Priority,
+					AgentStatus: backend.AgentStatus,
+				})
+			}
+			if tunnel.AgentIP == "" && len(backends) == 0 {
+				slog.Warn("Tunnel has no Agent backend", "tunnel_id", tunnel.ID, "domain", tunnel.Domain)
 				continue
 			}
 
@@ -164,6 +178,7 @@ func main() {
 				Enabled:    tunnel.Enabled,
 				TLSMode:    tunnel.TLSMode,
 				ForceHTTPS: tunnel.ForceHTTPS,
+				Backends:   backends,
 			}
 			routes = append(routes, route)
 		}
@@ -261,19 +276,20 @@ func main() {
 // ensureGatewayIPs adds gateway IPs for each tunnel's subnet to the WireGuard interface.
 // This lets the kernel select a proper source address when proxying to agent IPs.
 func ensureGatewayIPs(iface string, tunnels []struct {
-	ID                string `json:"id"`
-	Domain            string `json:"domain"`
-	AgentID           string `json:"agentId"`
-	Target            string `json:"target"`
-	Enabled           bool   `json:"enabled"`
-	Subnet            string `json:"subnet"`
-	GatewayIP         string `json:"gatewayIp"`
-	AgentIP           string `json:"agentIp"`
-	HTTPProxyEnabled  bool   `json:"httpProxyEnabled"`
-	SOCKSProxyEnabled bool   `json:"socksProxyEnabled"`
-	TLSMode           string `json:"tlsMode"`
-	CertificateID     string `json:"certificateId"`
-	ForceHTTPS        bool   `json:"forceHttps"`
+	ID                string             `json:"id"`
+	Domain            string             `json:"domain"`
+	AgentID           string             `json:"agentId"`
+	Target            string             `json:"target"`
+	Enabled           bool               `json:"enabled"`
+	Subnet            string             `json:"subnet"`
+	GatewayIP         string             `json:"gatewayIp"`
+	AgentIP           string             `json:"agentIp"`
+	Backends          []ws.TunnelBackend `json:"backends"`
+	HTTPProxyEnabled  bool               `json:"httpProxyEnabled"`
+	SOCKSProxyEnabled bool               `json:"socksProxyEnabled"`
+	TLSMode           string             `json:"tlsMode"`
+	CertificateID     string             `json:"certificateId"`
+	ForceHTTPS        bool               `json:"forceHttps"`
 }) {
 	// Bring interface up (ignore errors)
 	_ = exec.Command("ip", "link", "set", iface, "up").Run()

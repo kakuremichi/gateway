@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -13,10 +14,28 @@ import (
 type TunnelRoute struct {
 	ID         string
 	Domain     string
-	AgentIP    string // Agent's virtual IP (e.g., "10.1.0.100")
+	AgentIP    string // Legacy Agent virtual IP fallback.
 	Enabled    bool
 	TLSMode    string
 	ForceHTTPS bool
+	Backends   []BackendRoute
+
+	mu            sync.Mutex
+	currentWeight map[string]int
+	failedUntil   map[string]time.Time
+}
+
+// BackendRoute represents a selectable origin backend behind one tunnel.
+type BackendRoute struct {
+	ID          string
+	AgentID     string
+	AgentIP     string
+	Target      string
+	Enabled     bool
+	Draining    bool
+	Weight      int
+	Priority    int
+	AgentStatus string
 }
 
 // ControlCertificate represents a certificate bundle pushed from Control.
